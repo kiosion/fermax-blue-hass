@@ -19,6 +19,11 @@ from .streaming import streaming_deps_available
 
 _LOGGER = logging.getLogger(__name__)
 
+# How long a snapshot request waits for a connecting stream's first frame
+# before falling back to the stored photo. Keep under HomeKit's snapshot
+# timeout so a slow stream degrades to the old photo, not a blank tile.
+FIRST_FRAME_TIMEOUT_SECONDS = 3.0
+
 
 async def async_setup_entry(
     hass: HomeAssistant,
@@ -41,7 +46,8 @@ class FermaxCamera(FermaxBlueEntity, Camera):
     Supports two modes:
     - Still image: shows the last captured visitor photo (from doorbell ring)
     - Live stream: connects to the intercom camera via mediasoup and serves
-      MJPEG frames in real-time (triggered by turn_on / camera preview button)
+      MJPEG frames in real-time (triggered by turn_on, the camera preview
+      button, or a viewer connecting to the MJPEG stream)
     """
 
     _attr_translation_key = "visitor"
@@ -92,6 +98,12 @@ class FermaxCamera(FermaxBlueEntity, Camera):
         stream = self.coordinator.stream_session
         if stream and stream.latest_frame:
             return stream.latest_frame
+        if stream:
+            # A session is connecting (ring preview or auto-on): wait briefly
+            # so snapshot consumers get the live visitor, not the old photo.
+            frame = await stream.wait_for_first_frame(FIRST_FRAME_TIMEOUT_SECONDS)
+            if frame:
+                return frame
         return self.coordinator.last_photo
 
     async def handle_async_mjpeg_stream(self, request: web.Request) -> web.StreamResponse | None:
@@ -101,6 +113,11 @@ class FermaxCamera(FermaxBlueEntity, Camera):
         the MJPEG output switches seamlessly between live frames and the
         static preview without dropping the connection.
         """
+        # A viewer connected (e.g. HomeKit live view): start a live preview
+        # if nothing is streaming yet. Fire-and-forget so stills serve
+        # immediately while the session connects.
+        self.hass.async_create_task(self.coordinator.ensure_camera_preview())
+
         response = web.StreamResponse(
             status=200,
             reason="OK",

@@ -163,3 +163,42 @@ class TestSignalingHangup:
         await client.disconnect()
 
         sio.emit.assert_not_awaited()
+
+
+class TestFirstFrameWait:
+    """Snapshot waiters get the first frame, or None when none arrives."""
+
+    def _session(self) -> FermaxStreamSession:
+        return FermaxStreamSession(
+            signaling_url="https://signaler.example",
+            oauth_token="tok",
+            fcm_token="fcm",
+            room_id="room",
+        )
+
+    async def test_returns_frame_when_already_received(self):
+        session = self._session()
+        session._latest_frame = b"jpeg"
+        session._first_frame_event.set()
+
+        assert await session.wait_for_first_frame(0.1) == b"jpeg"
+
+    async def test_times_out_without_frame(self):
+        session = self._session()
+
+        assert await session.wait_for_first_frame(0.01) is None
+
+    async def test_grabber_end_wakes_waiters(self):
+        from aiortc.mediastreams import MediaStreamError
+
+        session = self._session()
+        track = MagicMock()
+        track.kind = "video"
+        track.recv = AsyncMock(side_effect=MediaStreamError())
+        session._consumer = MagicMock(track=track)
+        session._active = True
+
+        await session._grab_frames()
+
+        assert session._first_frame_event.is_set()
+        assert await session.wait_for_first_frame(0.01) is None

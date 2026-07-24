@@ -107,6 +107,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         self._last_call: CallLogEntry | None = None
         self._call_log: list[CallLogEntry] = []
         self._stream_session: FermaxStreamSession | None = None
+        self._preview_pending = False
         self._storage_path: Path | None = None
         self._auto_response_file = auto_response_file
         self._ring_preview = False
@@ -594,6 +595,21 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             self.async_set_updated_data(self.data)
 
         return result
+
+    async def ensure_camera_preview(self) -> None:
+        """Start an auto-on preview unless one is already active or starting.
+
+        Safe to call on every viewer connection: no-op while a stream session
+        exists, an auto-on is awaiting its Autoon notification, or another
+        call is in flight.
+        """
+        if self._preview_pending or self._camera_active or self._stream_session:
+            return
+        self._preview_pending = True
+        try:
+            await self.start_camera_preview()
+        finally:
+            self._preview_pending = False
 
     async def change_video_source(self) -> DivertResponse | None:
         """Request a video source change on the intercom."""

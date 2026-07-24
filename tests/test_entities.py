@@ -1,5 +1,7 @@
 """Tests for entity platforms."""
 
+import asyncio
+import contextlib
 from datetime import UTC
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -534,3 +536,76 @@ class TestCameraStreamingDepsGuard:
             await camera.async_turn_on()
 
         mock_coordinator.start_camera_preview.assert_awaited_once()
+
+
+class TestCameraSnapshotWait:
+    """Snapshots wait briefly for a connecting stream's first frame."""
+
+    def _make_camera(self, mock_coordinator):
+        from custom_components.fermax_blue.camera import FermaxCamera
+
+        return FermaxCamera(mock_coordinator)
+
+    @pytest.mark.asyncio
+    async def test_prefers_existing_live_frame(self, mock_coordinator):
+        camera = self._make_camera(mock_coordinator)
+        stream = MagicMock()
+        stream.latest_frame = b"live"
+        mock_coordinator.stream_session = stream
+
+        assert await camera.async_camera_image() == b"live"
+        stream.wait_for_first_frame.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_waits_for_first_frame_of_connecting_stream(self, mock_coordinator):
+        camera = self._make_camera(mock_coordinator)
+        stream = MagicMock()
+        stream.latest_frame = None
+        stream.wait_for_first_frame = AsyncMock(return_value=b"first")
+        mock_coordinator.stream_session = stream
+
+        assert await camera.async_camera_image() == b"first"
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_last_photo_on_timeout(self, mock_coordinator):
+        camera = self._make_camera(mock_coordinator)
+        stream = MagicMock()
+        stream.latest_frame = None
+        stream.wait_for_first_frame = AsyncMock(return_value=None)
+        mock_coordinator.stream_session = stream
+        mock_coordinator.last_photo = b"old"
+
+        assert await camera.async_camera_image() == b"old"
+
+    @pytest.mark.asyncio
+    async def test_no_stream_returns_last_photo(self, mock_coordinator):
+        camera = self._make_camera(mock_coordinator)
+        mock_coordinator.stream_session = None
+        mock_coordinator.last_photo = b"old"
+
+        assert await camera.async_camera_image() == b"old"
+
+
+class TestMjpegViewerStartsPreview:
+    """Opening the MJPEG stream kicks off a live preview when idle."""
+
+    @pytest.mark.asyncio
+    async def test_viewer_connect_schedules_preview(self, mock_coordinator):
+        from custom_components.fermax_blue.camera import FermaxCamera
+
+        camera = FermaxCamera(mock_coordinator)
+        camera.hass = MagicMock()
+        mock_coordinator.stream_session = None
+        mock_coordinator.last_photo = None
+
+        with patch("custom_components.fermax_blue.camera.web.StreamResponse") as response_cls:
+            response_cls.return_value.prepare = AsyncMock()
+            response_cls.return_value.write = AsyncMock()
+            task = asyncio.create_task(camera.handle_async_mjpeg_stream(MagicMock()))
+            await asyncio.sleep(0)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        camera.hass.async_create_task.assert_called_once()
+        mock_coordinator.ensure_camera_preview.assert_called_once()
