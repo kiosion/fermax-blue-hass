@@ -424,6 +424,7 @@ class FermaxStreamSession:
         self._recorder: Any = None
         self._frame_task: asyncio.Task | None = None
         self._latest_frame: bytes | None = None
+        self._first_frame_event = asyncio.Event()
         self._active = False
         self._room: Any = None
         self._recording_path: str | None = None
@@ -435,6 +436,17 @@ class FermaxStreamSession:
     @property
     def latest_frame(self) -> bytes | None:
         """Return the latest JPEG frame, or None if no frames yet."""
+        return self._latest_frame
+
+    async def wait_for_first_frame(self, max_wait: float) -> bytes | None:
+        """Wait up to `max_wait` seconds for the first frame.
+
+        Returns the frame, or None if the session ends or the wait times
+        out without one.
+        """
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(max_wait):
+                await self._first_frame_event.wait()
         return self._latest_frame
 
     async def start(self) -> bool:
@@ -870,6 +882,7 @@ class FermaxStreamSession:
                 img.save(buf, format="JPEG", quality=75)
                 self._latest_frame = buf.getvalue()
                 if frame_count == 1:
+                    self._first_frame_event.set()
                     _LOGGER.info("First frame received: %d bytes", len(self._latest_frame))
                 elif frame_count % 100 == 0:
                     _LOGGER.debug("Frame %d received", frame_count)
@@ -881,12 +894,15 @@ class FermaxStreamSession:
             _LOGGER.exception("Frame grabber error after %d frames", frame_count)
         finally:
             self._active = False
+            # Wake snapshot waiters even if no frame ever arrived
+            self._first_frame_event.set()
             if self._on_end:
                 self._on_end()
 
     async def stop(self) -> None:
         """Stop the streaming session and clean up."""
         self._active = False
+        self._first_frame_event.set()
 
         if self._frame_task and not self._frame_task.done():
             self._frame_task.cancel()

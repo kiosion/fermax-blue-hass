@@ -1,5 +1,6 @@
 """Tests for the Fermax Blue coordinator."""
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -100,6 +101,8 @@ def coordinator(mock_hass, mock_api, pairing):
         coord._call_mode = CALL_MODE_NOTIFY
         coord._auto_response_file = ""
         coord._ring_preview = False
+        coord._stream_session = None
+        coord._preview_pending = False
         coord._doorbell_reset_unsub = None
         coord._camera_timeout_unsub = None
         coord._dnd_enabled = None
@@ -384,6 +387,55 @@ class TestRingPreview:
         self._ring(coordinator)
 
         assert coordinator._start_stream.call_args.kwargs["receive_only"] is False
+
+
+class TestEnsureCameraPreview:
+    """Viewer-triggered preview starts are single-flight and idempotent."""
+
+    @pytest.mark.asyncio
+    async def test_starts_preview_when_idle(self, coordinator):
+        coordinator.start_camera_preview = AsyncMock()
+
+        await coordinator.ensure_camera_preview()
+
+        coordinator.start_camera_preview.assert_awaited_once()
+        assert coordinator._preview_pending is False
+
+    @pytest.mark.asyncio
+    async def test_skips_when_stream_session_exists(self, coordinator):
+        coordinator.start_camera_preview = AsyncMock()
+        coordinator._stream_session = MagicMock()
+
+        await coordinator.ensure_camera_preview()
+
+        coordinator.start_camera_preview.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_while_camera_active(self, coordinator):
+        coordinator.start_camera_preview = AsyncMock()
+        coordinator._camera_active = True
+
+        await coordinator.ensure_camera_preview()
+
+        coordinator.start_camera_preview.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_calls_start_once(self, coordinator):
+        release = asyncio.Event()
+
+        async def _slow_start():
+            await release.wait()
+
+        coordinator.start_camera_preview = AsyncMock(side_effect=_slow_start)
+
+        first = asyncio.create_task(coordinator.ensure_camera_preview())
+        await asyncio.sleep(0)
+        second = asyncio.create_task(coordinator.ensure_camera_preview())
+        await asyncio.sleep(0)
+        release.set()
+        await asyncio.gather(first, second)
+
+        coordinator.start_camera_preview.assert_awaited_once()
 
 
 class TestCoordinatorScanInterval:
