@@ -7,7 +7,7 @@ import logging
 import time
 from collections import deque
 from dataclasses import replace
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -49,6 +49,15 @@ CAMERA_TIMEOUT_SECONDS = 90
 # reload/restart, causing phantom doorbell rings. Ignore them briefly.
 NOTIFICATION_GRACE_PERIOD = 10
 ALLOWED_SIGNALING_DOMAIN = ".fermax.io"
+# A ring's registry entry appears server-side a few seconds after the FCM push.
+# The latest entry at refresh time may still be a prior call. Only accept a
+# photo if its call_date is newer than the ring, minus this skew.
+PHOTO_RECENCY_SKEW_SECONDS = 30
+# Re-fetch the call log on this backoff until the ring's entry registers,
+# then give up until the next ring. Delays are relative to the prior attempt.
+# ~+5s catches entries registered at call setup, ~+35s catches entries
+# registered when the ~30s ring times out, ~+95s is a backstop.
+PHOTO_RETRY_DELAYS = (5, 30, 60)
 
 
 def _is_trusted_signaling_url(url: str) -> bool:
@@ -88,7 +97,9 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         self._doorbell_ringing: bool = False
         self._camera_active: bool = False
 
-        self._photo_fetch_pending: bool = False
+        self._photo_pending_since: datetime | None = None
+        self._photo_retry_attempt: int = 0
+        self._photo_retry_unsub: CALLBACK_TYPE | None = None
         self._doorbell_reset_unsub: CALLBACK_TYPE | None = None
         self._camera_timeout_unsub: CALLBACK_TYPE | None = None
         self._dnd_enabled: bool | None = None
@@ -136,16 +147,23 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             return self._storage_path / f"last_frame_{self.pairing.device_id}.jpg"
         return None
 
+    def _photo_id_path(self) -> Path | None:
+        """Return the path for persisting the last fetched call photo id."""
+        if self._storage_path:
+            return self._storage_path / f"last_photo_id_{self.pairing.device_id}.txt"
+        return None
+
     async def _save_last_photo(self) -> None:
-        """Persist last photo to disk for survival across restarts."""
+        """Persist last photo and its photo id to disk for survival across restarts."""
         path = self._last_frame_path()
         if path and self._last_photo:
             await asyncio.to_thread(path.write_bytes, self._last_photo)
+        id_path = self._photo_id_path()
+        if id_path and self._last_photo_id:
+            await asyncio.to_thread(id_path.write_text, self._last_photo_id)
 
     async def _save_call_photo(self, photo: bytes) -> None:
         """Save a doorbell call photo to the recordings directory."""
-        from datetime import datetime
-
         media_root = self.hass.config.media_dirs.get("local", "/media")
         recordings_dir = Path(media_root) / RECORDINGS_DIR
         await asyncio.to_thread(recordings_dir.mkdir, parents=True, exist_ok=True)
@@ -155,7 +173,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         _LOGGER.info("Call photo saved: %s (%d KB)", path, len(photo) // 1024)
 
     async def _load_last_photo(self) -> None:
-        """Load persisted last photo from disk."""
+        """Load persisted last photo and photo id from disk."""
         path = self._last_frame_path()
         if path:
 
@@ -168,6 +186,18 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             if photo:
                 self._last_photo = photo
                 _LOGGER.info("Loaded persisted camera frame (%d bytes)", len(photo))
+
+        id_path = self._photo_id_path()
+        if id_path:
+
+            def _read_id() -> str | None:
+                if id_path.exists():
+                    return id_path.read_text().strip()
+                return None
+
+            photo_id = await asyncio.to_thread(_read_id)
+            if photo_id:
+                self._last_photo_id = photo_id
 
     @property
     def doorbell_ringing(self) -> bool:
@@ -229,17 +259,40 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
                     self._last_call = max(call_log, key=lambda c: c.call_date)
 
                     # Fetch photo only after a doorbell ring
-                    if self._photo_fetch_pending:
-                        self._photo_fetch_pending = False
+                    if self._photo_pending_since is not None:
                         latest = self._last_call
-                        if latest.photo_id and latest.photo_id != self._last_photo_id:
+                        call_date = latest.call_date
+                        if call_date.tzinfo is None:
+                            call_date = call_date.replace(tzinfo=UTC)
+                        recency_floor = self._photo_pending_since - timedelta(
+                            seconds=PHOTO_RECENCY_SKEW_SECONDS
+                        )
+                        # The ring's entry registers server-side with a delay.
+                        # An older latest entry means the photo we want isn't
+                        # there yet; keep fetch pending and retry.
+                        if (
+                            call_date >= recency_floor
+                            and latest.photo_id
+                            and latest.photo_id != self._last_photo_id
+                        ):
                             photo = await self.api.get_call_photo(latest.photo_id)
                             if photo:
+                                elapsed = datetime.now(UTC) - self._photo_pending_since
+                                _LOGGER.debug(
+                                    "Ring photo accepted %.0fs after ring (attempt %d)",
+                                    elapsed.total_seconds(),
+                                    self._photo_retry_attempt + 1,
+                                )
                                 self._last_photo = photo
                                 self._last_photo_id = latest.photo_id
+                                self._clear_photo_pending()
                                 self.hass.async_create_task(self._save_call_photo(photo))
+                                self.hass.async_create_task(self._save_last_photo())
             except Exception:
                 _LOGGER.debug("Failed to fetch call log/photo", exc_info=True)
+
+            if self._photo_pending_since is not None:
+                self._schedule_photo_retry()
 
         # Fetch DND status
         if self.notification_listener and self.notification_listener.fcm_token:
@@ -273,6 +326,38 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             "wireless_signal": device_info.wireless_signal,
         }
 
+    def _clear_photo_pending(self) -> None:
+        """Clear the pending ring photo state and cancel any scheduled retry."""
+        self._photo_pending_since = None
+        self._photo_retry_attempt = 0
+        if self._photo_retry_unsub:
+            self._photo_retry_unsub()
+            self._photo_retry_unsub = None
+
+    def _schedule_photo_retry(self) -> None:
+        """Schedule another call log fetch while the ring's photo is unregistered."""
+        if self.device_info and not self.device_info.photocaller:
+            # Photocaller is disabled, no photo will ever appear for this call
+            self._clear_photo_pending()
+            return
+        if self._photo_retry_unsub:
+            return
+        if self._photo_retry_attempt >= len(PHOTO_RETRY_DELAYS):
+            _LOGGER.debug("Ring photo never appeared in the call registry; giving up")
+            self._clear_photo_pending()
+            return
+        delay = PHOTO_RETRY_DELAYS[self._photo_retry_attempt]
+        self._photo_retry_attempt += 1
+
+        @callback
+        def _retry(_now: Any) -> None:
+            self._photo_retry_unsub = None
+            # Not async_request_refresh, its 10s debounce cooldown started by
+            # the ring's own refresh would swallow the short retry rung
+            self.hass.async_create_task(self.async_refresh())
+
+        self._photo_retry_unsub = async_call_later(self.hass, delay, _retry)
+
     async def setup_notifications(self, storage_path: Path) -> None:
         """Set up the FCM notification listener."""
         self._storage_path = storage_path
@@ -301,6 +386,7 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
 
     async def stop_notifications(self) -> None:
         """Stop the notification listener."""
+        self._clear_photo_pending()
         if self.notification_listener:
             if self.notification_listener.fcm_token:
                 await self.api.register_app_token(
@@ -379,7 +465,9 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         # Only trigger doorbell ring for actual calls, not auto-on
         if notification_type == "Call":
             self._doorbell_ringing = True
-            self._photo_fetch_pending = True
+            # A repeat ring restarts the pending window and retry ladder
+            self._clear_photo_pending()
+            self._photo_pending_since = datetime.now(UTC)
 
             door_key = data.get("AccessDoorKey", data.get("accessDoorKey", "GENERAL"))
             async_dispatcher_send(
