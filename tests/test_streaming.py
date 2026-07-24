@@ -202,3 +202,58 @@ class TestFirstFrameWait:
 
         assert session._first_frame_event.is_set()
         assert await session.wait_for_first_frame(0.01) is None
+
+
+class TestRecordingToggle:
+    """The record flag gates recording setup."""
+
+    def _session(self, tmp_path, record: bool) -> FermaxStreamSession:
+        return FermaxStreamSession(
+            signaling_url="https://signaler.example",
+            oauth_token="tok",
+            fcm_token="fcm",
+            room_id="room",
+            media_root=str(tmp_path),
+            record=record,
+        )
+
+    def test_record_false_skips_recording(self, tmp_path):
+        session = self._session(tmp_path, record=False)
+
+        session._init_recording()
+
+        assert session._recording_path is None
+        assert not hasattr(session, "_recording_frames")
+
+    def test_record_true_initializes_recording(self, tmp_path):
+        session = self._session(tmp_path, record=True)
+
+        session._init_recording()
+
+        assert session._recording_path is not None
+        assert session._recording_frames == []
+
+
+class TestHangupDecoupling:
+    """send_hangup is independent of receive_only when set explicitly."""
+
+    def _session(self, **kwargs) -> FermaxStreamSession:
+        return FermaxStreamSession(
+            signaling_url="https://signaler.example",
+            oauth_token="tok",
+            fcm_token="fcm",
+            room_id="room",
+            **kwargs,
+        )
+
+    def test_receive_only_defaults_to_no_hangup(self):
+        session = self._session(receive_only=True)
+        assert session._signaling._send_hangup is False
+
+    def test_preview_keeps_hangup_when_overridden(self):
+        session = self._session(receive_only=True, send_hangup=True)
+        assert session._signaling._send_hangup is True
+
+    def test_attending_session_hangs_up(self):
+        session = self._session(receive_only=False)
+        assert session._signaling._send_hangup is True

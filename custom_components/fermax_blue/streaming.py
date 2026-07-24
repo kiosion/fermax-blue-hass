@@ -394,6 +394,8 @@ class FermaxStreamSession:
         on_end: Callable[[], None] | None = None,
         media_root: str = "/media",
         receive_only: bool = False,
+        record: bool = True,
+        send_hangup: bool | None = None,
     ) -> None:
         # Enforce secure scheme for signaling URL
         if signaling_url and not signaling_url.startswith(("https://", "wss://")):
@@ -404,13 +406,20 @@ class FermaxStreamSession:
             signaling_url = signaling_url.replace("http://", "https://", 1).replace(
                 "ws://", "wss://", 1
             )
+        if send_hangup is None:
+            # Default: a receive-only session skips hangup so watching a
+            # still-ringing call does not end it. An auto-on preview overrides
+            # this to True: it has no call to leave ringing and should stop the
+            # intercom promptly.
+            send_hangup = not receive_only
         self._signaling = FermaxSignalingClient(
             signaling_url=signaling_url,
             oauth_token=oauth_token,
             fcm_token=fcm_token,
-            send_hangup=not receive_only,
+            send_hangup=send_hangup,
         )
         self._receive_only = receive_only
+        self._record = record
         self._room_id = room_id
         self._on_end = on_end
         self._media_root = media_root
@@ -667,6 +676,9 @@ class FermaxStreamSession:
 
     def _init_recording(self) -> None:
         """Initialize frame collection for recording."""
+        if not self._record:
+            self._recording_path = None
+            return
         try:
             from datetime import datetime
 

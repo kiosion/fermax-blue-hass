@@ -470,9 +470,23 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
                 )
                 socket_url = DEFAULT_SIGNALING_URL
             fermax_token = data.get("FermaxToken", "")
-            receive_only = notification_type == "Call" and not attend
+            # Auto-on is a view-only camera preview with no call to answer:
+            # make it one-way (no audio sent) and don't record it. A ringing
+            # Call we are not attending is also receive-only, but still records
+            # the visitor. The preview still hangs up to stop the intercom
+            # promptly; only the ring-watch keeps the default (no hangup, so a
+            # live call is not ended).
+            is_preview = notification_type == "Autoon"
+            receive_only = is_preview or (notification_type == "Call" and not attend)
             self.hass.async_create_task(
-                self._start_stream(room_id, socket_url, fermax_token, receive_only=receive_only)
+                self._start_stream(
+                    room_id,
+                    socket_url,
+                    fermax_token,
+                    receive_only=receive_only,
+                    record=not is_preview,
+                    send_hangup=True if is_preview else None,
+                )
             )
             if (
                 notification_type == "Call"
@@ -652,6 +666,8 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
         signaling_url: str,
         fermax_token: str = "",
         receive_only: bool = False,
+        record: bool = True,
+        send_hangup: bool | None = None,
     ) -> None:
         """Start a video stream session for the given room."""
         if not streaming_deps_available():
@@ -694,6 +710,8 @@ class FermaxBlueCoordinator(DataUpdateCoordinator):
             on_end=_on_stream_end,
             media_root=media_root,
             receive_only=receive_only,
+            record=record,
+            send_hangup=send_hangup,
         )
 
         success = await self._stream_session.start()

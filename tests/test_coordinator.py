@@ -341,10 +341,10 @@ class TestRingPhotoRecency:
 class TestRingPreview:
     """The ring preview option starts a receive-only stream without answering."""
 
-    def _ring(self, coordinator, persistent_id="n1"):
+    def _ring(self, coordinator, notif_type="Call", persistent_id="n1"):
         notification = {
             "data": {
-                "FermaxNotificationType": "Call",
+                "FermaxNotificationType": notif_type,
                 "RoomId": "room1",
                 "SocketUrl": "https://signaling-pro-duoxme.fermax.io",
                 "FermaxToken": "ftok",
@@ -367,7 +367,27 @@ class TestRingPreview:
         self._ring(coordinator)
 
         coordinator._start_stream.assert_called_once_with(
-            "room1", "https://signaling-pro-duoxme.fermax.io", "ftok", receive_only=True
+            "room1",
+            "https://signaling-pro-duoxme.fermax.io",
+            "ftok",
+            receive_only=True,
+            record=True,
+            send_hangup=None,
+        )
+
+    def test_autoon_preview_is_receive_only_and_unrecorded(self, coordinator):
+        coordinator.hass.async_create_task = MagicMock(side_effect=lambda coro: coro.close())
+        coordinator._start_stream = MagicMock()
+
+        self._ring(coordinator, notif_type="Autoon")
+
+        coordinator._start_stream.assert_called_once_with(
+            "room1",
+            "https://signaling-pro-duoxme.fermax.io",
+            "ftok",
+            receive_only=True,
+            record=False,
+            send_hangup=True,
         )
 
     def test_no_stream_in_notify_mode_by_default(self, coordinator):
