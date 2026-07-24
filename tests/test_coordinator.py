@@ -1,16 +1,19 @@
 """Tests for the Fermax Blue coordinator."""
 
+from datetime import UTC, datetime, timedelta
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from custom_components.fermax_blue.api import (
     AccessDoor,
+    CallLogEntry,
     DeviceInfo,
     FermaxBlueApi,
     Pairing,
 )
 from custom_components.fermax_blue.coordinator import (
+    PHOTO_RETRY_DELAYS,
     FermaxBlueCoordinator,
     _is_trusted_signaling_url,
 )
@@ -89,7 +92,10 @@ def coordinator(mock_hass, mock_api, pairing):
         coord._doorbell_ringing = False
         coord._camera_active = False
         coord._last_divert_response = None
-        coord._photo_fetch_pending = False
+        coord._photo_pending_since = None
+        coord._photo_retry_attempt = 0
+        coord._photo_retry_unsub = None
+        coord._storage_path = None
         coord._doorbell_reset_unsub = None
         coord._camera_timeout_unsub = None
         coord._dnd_enabled = None
@@ -227,6 +233,102 @@ class TestCoordinatorPhotoCaller:
         await coordinator.set_photo_caller(True)
         mock_api.set_photo_caller.assert_called_once_with("dev1", enabled=True)
         assert coordinator.device_info.photocaller is True
+
+
+class TestRingPhotoRecency:
+    """Ring photos are accepted by call recency and retried until registered."""
+
+    @pytest.mark.asyncio
+    async def test_stale_entry_rejected_then_fresh_accepted(self, coordinator, mock_api):
+        ring_time = datetime.now(UTC)
+        stale = CallLogEntry(
+            call_id="c1",
+            device_id="dev1",
+            call_date=ring_time - timedelta(minutes=7),
+            photo_id="old",
+            answered=False,
+        )
+        fresh = CallLogEntry(
+            call_id="c2",
+            device_id="dev1",
+            call_date=ring_time + timedelta(seconds=2),
+            photo_id="new",
+            answered=False,
+        )
+        mock_api.get_call_log = AsyncMock(side_effect=[[stale], [stale, fresh]])
+        mock_api.get_call_photo = AsyncMock(return_value=b"jpeg")
+        coordinator.hass.async_create_task = MagicMock(side_effect=lambda coro: coro.close())
+        coordinator.notification_listener = MagicMock()
+        coordinator.notification_listener.fcm_token = "tok"
+        coordinator._photo_pending_since = ring_time
+
+        unsub = MagicMock()
+        with patch(
+            "custom_components.fermax_blue.coordinator.async_call_later",
+            return_value=unsub,
+        ) as mock_later:
+            await coordinator._async_update_data()
+
+            # First fetch sees only the previous call. No photo, retry scheduled
+            mock_api.get_call_photo.assert_not_awaited()
+            assert coordinator._photo_pending_since == ring_time
+            mock_later.assert_called_once()
+            assert mock_later.call_args.args[1] == PHOTO_RETRY_DELAYS[0]
+
+            await coordinator._async_update_data()
+
+        # Second fetch sees the ring's entry. Photo accepted, retry canceled
+        assert coordinator._last_photo == b"jpeg"
+        assert coordinator._last_photo_id == "new"
+        assert coordinator._photo_pending_since is None
+        unsub.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_photo_id_persisted_across_restart(self, coordinator, tmp_path):
+        coordinator._storage_path = tmp_path
+        coordinator._last_photo = b"img"
+        coordinator._last_photo_id = "p123"
+        await coordinator._save_last_photo()
+
+        coordinator._last_photo = None
+        coordinator._last_photo_id = None
+        await coordinator._load_last_photo()
+
+        assert coordinator._last_photo == b"img"
+        assert coordinator._last_photo_id == "p123"
+
+    def test_retry_ladder_gives_up(self, coordinator):
+        coordinator._photo_pending_since = datetime.now(UTC)
+        coordinator._photo_retry_attempt = len(PHOTO_RETRY_DELAYS)
+
+        with patch("custom_components.fermax_blue.coordinator.async_call_later") as mock_later:
+            coordinator._schedule_photo_retry()
+
+        assert coordinator._photo_pending_since is None
+        assert coordinator._photo_retry_attempt == 0
+        mock_later.assert_not_called()
+
+    def test_no_retry_without_photocaller(self, coordinator):
+        coordinator.device_info = DeviceInfo(
+            device_id="dev1",
+            connection_state="Connected",
+            status="ACTIVATED",
+            family="MONITOR",
+            device_type="VEO-XL",
+            subtype="WIFI",
+            unit_number=42,
+            photocaller=False,
+            streaming_mode="video_call",
+            is_monitor=True,
+            wireless_signal=4,
+        )
+        coordinator._photo_pending_since = datetime.now(UTC)
+
+        with patch("custom_components.fermax_blue.coordinator.async_call_later") as mock_later:
+            coordinator._schedule_photo_retry()
+
+        assert coordinator._photo_pending_since is None
+        mock_later.assert_not_called()
 
 
 class TestCoordinatorScanInterval:
