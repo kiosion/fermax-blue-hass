@@ -179,6 +179,7 @@ class FermaxBlueApi:
         self._username = username
         self._password = password
         self._access_token: str | None = None
+        self._refresh_token: str | None = None
         self._token_expires_at: float = 0
         self._auth_url = auth_url
         self._base_url = base_url
@@ -241,11 +242,28 @@ class FermaxBlueApi:
         }
 
     async def authenticate(self) -> str:
-        """Authenticate with Fermax Blue and return access token."""
+        """Authenticate with Fermax Blue and return access token.
+
+        Uses the refresh_token grant when a refresh token from a previous
+        authentication is available (as the official app does), falling back
+        to the password grant when there is none or the server rejects it.
+        """
+        if self._refresh_token:
+            refresh_payload = f"grant_type=refresh_token&refresh_token={quote(self._refresh_token)}"
+            try:
+                return await self._request_token(refresh_payload)
+            except FermaxAuthError:
+                _LOGGER.debug("Refresh token rejected; falling back to password grant")
+                self._refresh_token = None
+
         username = quote(self._username)
         password = quote(self._password)
-        payload = f"grant_type=password&password={password}&username={username}"
+        return await self._request_token(
+            f"grant_type=password&password={password}&username={username}"
+        )
 
+    async def _request_token(self, payload: str) -> str:
+        """POST an OAuth token request and store the resulting tokens."""
         headers = {
             "Authorization": self._auth_basic,
             "Content-Type": "application/x-www-form-urlencoded",
@@ -310,6 +328,9 @@ class FermaxBlueApi:
             raise FermaxApiError("Fermax authentication response did not include access_token")
 
         self._access_token = data["access_token"]
+        # The server may rotate the refresh token on each grant; keep the
+        # previous one when the response omits it.
+        self._refresh_token = data.get("refresh_token") or self._refresh_token
         self._token_expires_at = time.time() + data.get("expires_in", 3600) - 60
         _LOGGER.debug("Authenticated with Fermax Blue")
         return self._access_token
