@@ -185,6 +185,72 @@ class TestAuthentication:
         assert info.device_id == "dev1"
         assert api._access_token == "new_token"
 
+    @pytest.mark.asyncio
+    async def test_refresh_token_grant_preferred_on_reauth(self, api):
+        """Re-auth uses the refresh_token grant instead of re-sending the password."""
+        first = _mock_response(
+            200,
+            json={"access_token": "tok1", "refresh_token": "refresh1", "expires_in": 3600},
+        )
+        second = _mock_response(
+            200,
+            json={"access_token": "tok2", "refresh_token": "refresh2", "expires_in": 3600},
+        )
+
+        with patch("httpx.AsyncClient.post", side_effect=[first, second]) as mock_post:
+            await api.authenticate()
+            api._token_expires_at = 0
+            token = await api.authenticate()
+
+        assert token == "tok2"
+        assert api.is_authenticated
+        payloads = [call.kwargs["content"] for call in mock_post.call_args_list]
+        assert "grant_type=password" in payloads[0]
+        assert payloads[1] == "grant_type=refresh_token&refresh_token=refresh1"
+        assert "testpass123" not in payloads[1]
+        assert api._refresh_token == "refresh2"
+
+    @pytest.mark.asyncio
+    async def test_rejected_refresh_token_falls_back_to_password(self, api):
+        """A rejected refresh token discards it and retries with the password grant."""
+        api._refresh_token = "stale_refresh"
+        rejected = _mock_response(
+            400,
+            json={"error": "invalid_grant", "error_description": "Token expired"},
+        )
+        password_ok = _mock_response(
+            200,
+            json={"access_token": "tok_new", "refresh_token": "refresh_new", "expires_in": 3600},
+        )
+
+        with patch("httpx.AsyncClient.post", side_effect=[rejected, password_ok]) as mock_post:
+            token = await api.authenticate()
+
+        assert token == "tok_new"
+        payloads = [call.kwargs["content"] for call in mock_post.call_args_list]
+        assert payloads[0] == "grant_type=refresh_token&refresh_token=stale_refresh"
+        assert "grant_type=password" in payloads[1]
+        assert api._refresh_token == "refresh_new"
+
+    @pytest.mark.asyncio
+    async def test_refresh_grant_api_error_propagates(self, api):
+        """A server failure during refresh propagates instead of burning the token."""
+        api._refresh_token = "refresh1"
+        resp = _mock_response(
+            502,
+            text="<html>bad gateway</html>",
+            headers={"content-type": "text/html"},
+        )
+
+        with (
+            patch("httpx.AsyncClient.post", return_value=resp) as mock_post,
+            pytest.raises(FermaxApiError),
+        ):
+            await api.authenticate()
+
+        assert mock_post.call_count == 1
+        assert api._refresh_token == "refresh1"
+
 
 class TestRetryLogic:
     """Test request retry with backoff."""
