@@ -4,6 +4,7 @@ import asyncio
 import binascii
 import inspect
 import logging
+import re
 from base64 import urlsafe_b64decode
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -21,6 +22,7 @@ from custom_components.fermax_blue.notification import (
     _b64_pad,
     _FcmExcInfoRateLimitFilter,
     _patch_fcm_decrypt,
+    _patch_fcm_latency_logging,
 )
 
 
@@ -527,4 +529,70 @@ def test_patch_is_idempotent(restore_fcm_decrypt):
     first = inspect.getattr_static(FcmPushClient, "_decrypt_raw_data")
     _patch_fcm_decrypt()
     second = inspect.getattr_static(FcmPushClient, "_decrypt_raw_data")
+    assert first is second
+
+
+@pytest.fixture
+def restore_fcm_handle_data_message():
+    """Restore FcmPushClient._handle_data_message after a test mutates it."""
+    original = inspect.getattr_static(FcmPushClient, "_handle_data_message")
+    yield
+    FcmPushClient._handle_data_message = original
+
+
+def test_latency_patch_logs_sent_delta_and_delegates(restore_fcm_handle_data_message, caplog):
+    """The patch logs the server 'sent' vs receipt delta and calls the original."""
+    import time as time_mod
+
+    received = {}
+
+    def _spy(self, msg):
+        received["msg"] = msg
+
+    FcmPushClient._handle_data_message = _spy
+    _patch_fcm_latency_logging()
+
+    class _Msg:
+        sent = int((time_mod.time() - 5.0) * 1000)
+
+    client = object.__new__(FcmPushClient)
+    with caplog.at_level(logging.INFO, logger="custom_components.fermax_blue.notification"):
+        FcmPushClient._handle_data_message(client, _Msg())
+
+    assert isinstance(received["msg"], _Msg)
+    match = re.search(r"received \+?(\d+\.\d+)s later", caplog.text)
+    assert match, caplog.text
+    assert abs(float(match.group(1)) - 5.0) < 1.0
+
+
+def test_latency_patch_skips_log_without_sent_and_still_delegates(
+    restore_fcm_handle_data_message, caplog
+):
+    """A stanza without a 'sent' timestamp delegates without logging."""
+    received = {}
+
+    def _spy(self, msg):
+        received["msg"] = msg
+
+    FcmPushClient._handle_data_message = _spy
+    _patch_fcm_latency_logging()
+
+    class _Msg:
+        sent = 0
+
+    client = object.__new__(FcmPushClient)
+    with caplog.at_level(logging.INFO, logger="custom_components.fermax_blue.notification"):
+        FcmPushClient._handle_data_message(client, _Msg())
+
+    assert isinstance(received["msg"], _Msg)
+    assert "FCM transport" not in caplog.text
+
+
+def test_latency_patch_is_idempotent(restore_fcm_handle_data_message):
+    """Calling the latency patch twice does not re-wrap _handle_data_message."""
+    FcmPushClient._handle_data_message = lambda self, msg: None
+    _patch_fcm_latency_logging()
+    first = inspect.getattr_static(FcmPushClient, "_handle_data_message")
+    _patch_fcm_latency_logging()
+    second = inspect.getattr_static(FcmPushClient, "_handle_data_message")
     assert first is second

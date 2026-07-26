@@ -8,6 +8,7 @@ import logging
 import time
 from collections import deque
 from collections.abc import Callable
+from datetime import UTC, datetime
 from typing import Any
 
 from firebase_messaging import FcmPushClient, FcmPushClientConfig
@@ -138,6 +139,36 @@ def _patch_fcm_decrypt() -> None:
     )
 
 
+def _patch_fcm_latency_logging() -> None:
+    """Log server-to-client transport latency for every FCM data message.
+
+    The MCS ``DataMessageStanza`` carries a server-side ``sent`` timestamp
+    (epoch milliseconds). Comparing it with local receipt time splits a
+    delayed doorbell push into its two possible causes, indistinguishable
+    from the notification callback alone: Fermax handing the push to FCM
+    late (ring-to-``sent`` gap) versus the push sitting queued at Google or
+    in transit (``sent``-to-receipt gap). Assumes an NTP-synced local
+    clock. Idempotent, same pattern as the decrypt patch above.
+    """
+    original = FcmPushClient._handle_data_message
+    if getattr(original, "_fermax_latency_patched", False):
+        return
+
+    def _handle_data_message_timed(self: FcmPushClient, msg: Any) -> None:
+        sent_ms = getattr(msg, "sent", 0)
+        if sent_ms:
+            sent_at = datetime.fromtimestamp(sent_ms / 1000, tz=UTC)
+            _LOGGER.info(
+                "FCM transport: server sent %s, received %+.2fs later",
+                sent_at.isoformat(timespec="milliseconds"),
+                time.time() - sent_ms / 1000,
+            )
+        return original(self, msg)
+
+    _handle_data_message_timed._fermax_latency_patched = True  # type: ignore[attr-defined]
+    FcmPushClient._handle_data_message = _handle_data_message_timed  # type: ignore[method-assign]
+
+
 _SENSITIVE_LOG_KEYS = frozenset(
     {"FermaxToken", "fermaxOauthToken", "appToken", "token", "fcm_token"}
 )
@@ -264,6 +295,7 @@ class FermaxNotificationListener:
 
         _install_fcm_log_rate_limit()
         _patch_fcm_decrypt()
+        _patch_fcm_latency_logging()
 
         # Bounded abort: let the upstream client give up after a few sequential
         # errors instead of spinning forever on a poisoned reader; the watchdog
